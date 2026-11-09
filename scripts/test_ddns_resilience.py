@@ -327,5 +327,95 @@ class StopPhraseFollowsMode(unittest.TestCase):
         self.assertIn("已强制普通停机", message.text)
 
 
+class ResolveZoneId(unittest.TestCase):
+    """Zone 自动识别：按 Cloudflare 的 Zone 列表做最长后缀匹配。
+
+    回归用例：`hk.cscec.ac.cn` 的 Zone 是 `cscec.ac.cn`，旧代码取最后
+    两段得到 `ac.cn`，查不到 Zone 就报错。"""
+
+    def setUp(self) -> None:
+        self.calls: list[str] = []
+        self._orig_get = ddns.requests.get
+
+    def tearDown(self) -> None:
+        ddns.requests.get = self._orig_get
+
+    def _fake_get(self, zones_by_name, status=200):
+        def _get(url, headers=None, params=None, timeout=None):  # noqa: ANN001, ANN202
+            self.calls.append((params or {}).get("name", ""))
+            result = zones_by_name.get((params or {}).get("name", ""), [])
+            return _FakeResponse(status, result)
+
+        return _get
+
+    def test_ac_cn_suffix_resolves_to_parent_zone(self):
+        ddns.requests.get = self._fake_get(
+            {"cscec.ac.cn": [{"id": "zone-cscec"}]}
+        )
+        zone_id = ddns._resolve_zone_id({}, {}, "hk.cscec.ac.cn")  # noqa: SLF001
+        self.assertEqual(zone_id, "zone-cscec")
+        # 先问过记录本身，再问 cscec.ac.cn，绝不能问 ac.cn 就停下
+        self.assertEqual(self.calls, ["hk.cscec.ac.cn", "cscec.ac.cn"])
+
+    def test_plain_com_resolves(self):
+        ddns.requests.get = self._fake_get(
+            {"example.com": [{"id": "zone-example"}]}
+        )
+        self.assertEqual(
+            ddns._resolve_zone_id({}, {}, "www.example.com"),  # noqa: SLF001
+            "zone-example",
+        )
+        self.assertEqual(self.calls, ["www.example.com", "example.com"])
+
+    def test_apex_record_is_its_own_zone(self):
+        ddns.requests.get = self._fake_get(
+            {"example.com": [{"id": "zone-example"}]}
+        )
+        self.assertEqual(
+            ddns._resolve_zone_id({}, {}, "example.com"),  # noqa: SLF001
+            "zone-example",
+        )
+        self.assertEqual(self.calls, ["example.com"])
+
+    def test_no_match_raises(self):
+        ddns.requests.get = self._fake_get({})
+        with self.assertRaises(ValueError) as ctx:
+            ddns._resolve_zone_id({}, {}, "foo.bar.invalid")  # noqa: SLF001
+        self.assertIn("foo.bar.invalid", str(ctx.exception))
+        # 单段后缀（invalid）不可能是 Zone，不查
+        self.assertEqual(self.calls, ["foo.bar.invalid", "bar.invalid"])
+
+    def test_manual_zone_id_wins_without_http(self):
+        ddns.requests.get = self._fake_get({})
+        self.assertEqual(
+            ddns._resolve_zone_id({}, {"ddns_zone_id": "zone-manual"}, "hk.cscec.ac.cn"),  # noqa: SLF001
+            "zone-manual",
+        )
+        self.assertEqual(self.calls, [])
+
+    def test_empty_record_raises(self):
+        ddns.requests.get = self._fake_get({})
+        with self.assertRaises(ValueError):
+            ddns._resolve_zone_id({}, {}, "")  # noqa: SLF001
+        self.assertEqual(self.calls, [])
+
+    def test_first_query_failing_is_not_a_zone_miss(self):
+        """首个候选就 HTTP 403：认证有问题，别挨个候选试完再报「识别不出」。"""
+        ddns.requests.get = self._fake_get({}, status=403)
+        with self.assertRaises(ValueError):
+            ddns._resolve_zone_id({}, {}, "hk.cscec.ac.cn")  # noqa: SLF001
+        self.assertEqual(self.calls, ["hk.cscec.ac.cn"])
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, result: list) -> None:
+        self.status_code = status_code
+        self._result = result
+        self.content = b"{}" if result is not None else b""
+
+    def json(self):  # noqa: ANN202
+        return {"result": self._result}
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

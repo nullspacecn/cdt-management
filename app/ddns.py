@@ -150,9 +150,16 @@ def is_public_ipv4(value: str) -> bool:
     )
 
 
-def _root_domain(record: str) -> str:
-    parts = record.strip().split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else record
+def _zone_candidates(record: str) -> list[str]:
+    """从长到短列出记录名可能的 Zone 后缀（含记录本身，至少保留两段）。
+
+    Zone 名不能靠「取最后两段」猜：`hk.cscec.ac.cn` 的 Zone 是
+    `cscec.ac.cn`，不是 `ac.cn`（`ac.cn` 这类二级域的最后两段只是公共
+    后缀）。正确做法是按 Cloudflare 的 Zone 列表逐个后缀精确匹配，
+    最长命中者胜。
+    """
+    parts = record.strip().strip(".").split(".")
+    return [".".join(parts[i:]) for i in range(len(parts) - 1)]
 
 
 def _resolve_zone_id(headers: dict[str, str], config: dict[str, str], record: str) -> str:
@@ -161,18 +168,25 @@ def _resolve_zone_id(headers: dict[str, str], config: dict[str, str], record: st
         return zone_id
     if not record:
         raise ValueError("DDNS 记录名未配置")
-    root = _root_domain(record)
-    response = requests.get(
-        f"{API}/zones",
-        headers=headers,
-        params={"name": root, "status": "active"},
-        timeout=settings.HTTP_TIMEOUT,
-    )
-    payload = response.json() if response.content else {}
-    zones = payload.get("result") or []
-    if response.status_code != 200 or not zones:
-        raise ValueError(f"无法自动识别 {root} 的 Zone ID，请手动填写")
-    return str(zones[0]["id"])
+    record = record.strip().strip(".")
+    for index, candidate in enumerate(_zone_candidates(record)):
+        response = requests.get(
+            f"{API}/zones",
+            headers=headers,
+            params={"name": candidate, "status": "active"},
+            timeout=settings.HTTP_TIMEOUT,
+        )
+        if response.status_code != 200:
+            # 首个候选就报错通常是认证/权限问题，后面的候选也一样，
+            # 直接报错别把 token 问题伪装成「识别不出 Zone」。
+            if index == 0:
+                raise ValueError(f"无法自动识别 {record} 的 Zone ID，请手动填写")
+            continue
+        payload = response.json() if response.content else {}
+        zones = payload.get("result") or []
+        if zones:
+            return str(zones[0]["id"])
+    raise ValueError(f"无法自动识别 {record} 的 Zone ID，请手动填写")
 
 
 def _find_record(

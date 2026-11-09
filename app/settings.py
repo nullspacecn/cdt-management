@@ -7,8 +7,8 @@ from pathlib import Path
 
 APP_NAME = "cdt-management"
 # fork 版本：基于上游 1.3.8，新增 daily24 排班（03:00/24h）、DDNS 前置同步、
-# 面板内置 Kuma 心跳。见仓库根目录的 FORK_CHANGES.md。
-VERSION = "1.3.9-fork"
+# 面板内置 Kuma 心跳、DDNS Zone 最长后缀匹配。见仓库根目录的 FORK_CHANGES.md。
+VERSION = "1.3.10-fork"
 
 DATA_DIR = Path(os.environ.get("CDT_DATA_DIR", "./data")).resolve()
 DB_PATH = DATA_DIR / "cdt-management.db"

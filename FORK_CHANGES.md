@@ -1,7 +1,7 @@
 # Fork 改动说明（nullspacecn/cdt-management，基于上游 v1.3.8）
 
 > 基线：fork 与上游在同一提交 `bd1c563`（v1.3.8），fork 本身无任何私改，
-> 以下全部改动都在本 fork 副本里做。版本改为 `1.3.9-fork`。
+> 以下全部改动都在本 fork 副本里做。版本改为 `1.3.10-fork`。
 > 目标：用本面板替换现有 CDT 换班脚本（`/root/cdt-rotation/rotate.py`，
 > 北京时间 00:00/12:00、每人 12 小时），改为北京时间每天 03:00 换班一次、
 > 每人 24 小时，并用单域名 `hk.cscec.ac.cn` 做无感切换。
@@ -64,7 +64,24 @@
   线程卡死/进程僵死时这里不再执行，Kuma 自然标 DOWN。
 - 部署时填入现有的 CDT push 监控 URL（在 Kuma 库里，服务器本机取，不经聊天）。
 
-## 4. 未改的语义（已评估、可接受，需部署时知情）
+## 4. DDNS Zone 自动识别改为最长后缀匹配
+
+上游 `_resolve_zone_id`（`app/ddns.py`）取记录名最后两段当 Zone 名：
+`hk.cscec.ac.cn` → `ac.cn`，`GET /zones?name=ac.cn` 查不到 Zone 就报
+“无法自动识别 ac.cn 的 Zone ID”。`ac.cn` 这类二级域（以及 `co.uk` 等）
+的最后两段只是公共后缀，不是 Zone。
+
+改为从长到短逐个后缀精确匹配（`_zone_candidates`）：`hk.cscec.ac.cn` →
+先问 `hk.cscec.ac.cn`，再问 `cscec.ac.cn`（命中），最长命中者胜；
+单段后缀不查；手动填的 `ddns_zone_id` 仍优先，不发任何请求。
+首个候选就 HTTP 非 200（通常是认证问题）时直接报错，不把 token 问题
+伪装成“识别不出 Zone”。
+
+测试：`scripts/test_ddns_resilience.py` 新增 `ResolveZoneId`（7 项）：
+ac.cn 后缀解析到父 Zone、普通 com、apex 记录本身就是 Zone、无匹配报错、
+手动 zone_id 优先且不发请求、空记录、首候选 403 直接报错。
+
+## 5. 未改的语义（已评估、可接受，需部署时知情）
 
 - **无 `manual_stopped` / 人工接管**：面板上手停当班实例，下一轮对账
   （≤60 秒）即按排班重新拉起。想人为按住一台只能停用整个换班组或移出成员。
@@ -82,7 +99,7 @@
   超时、流量故障转移、双超全局熔断、节省停机、Telegram（仅 token+chat_id）。
   每日汇总默认 23:58，部署时在面板设置里改为 **23:55**（配置项，不改代码）。
 
-## 5. 测试
+## 6. 测试
 
 - 新增 `scripts/test_daily24.py`（7 项）：排班交替（2026-11-09–12
   逐日 A/B）、`next_switch_at`、组校验、daily24 换班全流程（DDNS 在停机前、
@@ -90,13 +107,17 @@
   健康通过才推且间隔内不重复推）。
 - 更新 `scripts/test_shift_flow.py` 与 `scripts/test_group_lifecycle.py`
   的 DDNS 顺序断言（DDNS 在停机前），其余断言不变。
+- 新增 `scripts/test_ddns_resilience.py` 的 `ResolveZoneId`（7 项）：
+  ac.cn 后缀解析到父 Zone、普通 com、apex 记录本身就是 Zone、无匹配报错、
+  手动 zone_id 优先且不发请求、空记录、首候选 403 直接报错。
 - 全套测试结果（`CDT_DRY_RUN=1`，不碰真实阿里云）：
-  全部通过，除 `scripts/test_entrypoint.py` 的 4 个错误——该 4 项在
+  350 通过、4 失败（共 354 项；1.3.9 时为 343/347，新增 7 项全部通过），
+  失败的 4 项全在 `scripts/test_entrypoint.py`——该 4 项在
   未改动的基线（`git stash` 后）同样失败，原因是本机以 root 运行、
   `docker-entrypoint.py` 的路径解析在测试环境抛错，与本次改动无关
   （`docker-entrypoint.py` 未动）。
 
-## 6. 部署方案（先不部署，等父 agent 定切过去的时间）
+## 7. 部署方案（先不部署，等父 agent 定切过去的时间）
 
 准备（换班点之前做，不影响运行中的旧脚本）：
 1. 备份（甲骨文 + VM 各一份）：`/root/cdt-rotation/` 全目录、
@@ -106,7 +127,7 @@
    `git pull` 未验证的代码）：
    `git clone https://github.com/nullspacecn/cdt-management.git`（先把本 fork
    的改动 commit + push 到 fork；部署用的就是这个提交），
-   `docker build -t cdt-management:fork-1.3.9 .`，
+   `docker build -t cdt-management:fork-1.3.10 .`，
    `docker-compose.yml` 的 image 改为该镜像、端口改为 `127.0.0.1:8282:8080`，
    `mkdir -p /opt/docker/cdt-management`，`docker compose up -d`。
    上线后新增备份：`/opt/docker/cdt-management/` 全目录
@@ -147,7 +168,7 @@
 `docker start alicdt-manager` + nginx 上游改回 8000 → 停 Kuma 心跳
 （旧脚本恢复后继续每 5 分钟推）→ 确认 duty 与班次一致。
 
-## 7. 切过去的时间（评估结论：今晚来不及）
+## 8. 切过去的时间（评估结论：今晚来不及）
 
 - 现在是北京时间 2026-11-10 02:32 左右，距 03:00 换班点约 30 分钟。
   代码修改与 dry-run 测试已完成，但部署验证（构建镜像、配面板、验 DDNS
@@ -164,7 +185,7 @@
   的当班是 B，旧规则 00:00 换 A——启用瞬间新面板会把 A 停掉、B 开起来，
   是一次“纠正”而非换班，需在场观察。推荐 **11-10 12:00** 那个点。
 
-## 8. 总览首页 CDT 板块（切过去后会断，需另做）
+## 9. 总览首页 CDT 板块（切过去后会断，需另做）
 
 它现在 SSH 读 `/root/cdt-rotation/state.json` + `systemctl is-active cdt-rotation`
 （`space-versions/zong-lan-shou-ye/.../privileged.ts:98-100`、`actions.ts:306-470`），
