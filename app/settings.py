@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 
 APP_NAME = "cdt-management"
-VERSION = "1.3.8"
+# fork 版本：基于上游 1.3.8，新增 daily24 排班（03:00/24h）、DDNS 前置同步、
+# 面板内置 Kuma 心跳。见仓库根目录的 FORK_CHANGES.md。
+VERSION = "1.3.9-fork"
 
 DATA_DIR = Path(os.environ.get("CDT_DATA_DIR", "./data")).resolve()
 DB_PATH = DATA_DIR / "cdt-management.db"
@@ -22,8 +24,8 @@ BOOTSTRAP_PASSWORD = os.environ.get("CDT_ADMIN_PASSWORD", "").strip()
 
 BRAND = os.environ.get("CDT_BRAND", "CDT-Management")
 
-# 「关于」里检查更新用的仓库
-REPO = os.environ.get("CDT_REPO", "BeacherZ/cdt-management")
+# 「关于」里检查更新用的仓库（fork：指向用户自己的仓库）
+REPO = os.environ.get("CDT_REPO", "nullspacecn/cdt-management")
 
 # 对账间隔（秒）。低于 30 秒会打爆阿里云 API 配额。
 RECONCILE_INTERVAL = max(30, int(os.environ.get("CDT_RECONCILE_INTERVAL", "60")))

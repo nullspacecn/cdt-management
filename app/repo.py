@@ -833,14 +833,24 @@ def upsert_group(payload: dict[str, Any]) -> int:
     name = str(payload.get("name") or "").strip() or "换班组"
     enabled = 1 if payload.get("enabled", True) else 0
     failover = 1 if payload.get("failover_enabled", True) else 0
-    # 排班周期：day = 一天一轮（按小时 / 固定时刻表），month = 一月一轮（按天）。
+    # 排班周期：day = 一天一轮（按小时 / 固定时刻表），month = 一月一轮（按天），
+    # daily24 = 每天固定时刻换班一次、每人 24 小时（fork 新增）。
     # 没传就沿用库里的旧值，别把一月一轮的组顺手改回一天一轮。
     if "cycle" in payload:
-        cycle = "month" if str(payload.get("cycle") or "").strip() == "month" else "day"
+        raw_cycle = str(payload.get("cycle") or "").strip()
+        cycle = raw_cycle if raw_cycle in ("month", "daily24") else "day"
     else:
         row = db.query_one("SELECT cycle FROM shift_groups WHERE id=?", (group_id,))
         cycle = str((row["cycle"] if row else "") or "day")
     month_cycle = cycle == "month"
+    daily24_cycle = cycle == "daily24"
+    # daily24 的每日换班时刻（HH:MM，默认 03:00）；其余周期忽略该字段。
+    switch_time = str(payload.get("switch_time") or "").strip() or "03:00"
+    if not is_hhmm(switch_time):
+        raise ValueError(f"换班时刻「{switch_time}」格式应为 HH:MM")
+    if "switch_time" not in payload:
+        row = db.query_one("SELECT switch_time FROM shift_groups WHERE id=?", (group_id,))
+        switch_time = str((row["switch_time"] if row else "") or "03:00")
     # 域名绑定已经挪到 DNS 页，这里只管老字段：没传就保持原值，别被整表提交清空
     if "ddns_record" in payload:
         ddns_record = str(payload.get("ddns_record") or "").strip()
@@ -942,6 +952,10 @@ def upsert_group(payload: dict[str, Any]) -> int:
                 )["cycle"]
                 or "day"
             )
+            old_switch_row = conn.execute(
+                "SELECT switch_time FROM shift_groups WHERE id=?", (group_id,)
+            ).fetchone()
+            old_switch_time = str((old_switch_row["switch_time"] if old_switch_row else "") or "03:00")
             old_signature = [
                 (
                     row["server_id"],
@@ -965,11 +979,15 @@ def upsert_group(payload: dict[str, Any]) -> int:
                 for m in members
             ]
             conn.execute(
-                "UPDATE shift_groups SET name=?, enabled=?, failover_enabled=?, ddns_record=?, cycle=? "
-                "WHERE id=?",
-                (name, enabled, failover, ddns_record, cycle, group_id),
+                "UPDATE shift_groups SET name=?, enabled=?, failover_enabled=?, ddns_record=?, cycle=?, "
+                "switch_time=? WHERE id=?",
+                (name, enabled, failover, ddns_record, cycle, switch_time, group_id),
             )
-            if old_signature != new_signature or old_cycle != cycle:
+            if (
+                old_signature != new_signature
+                or old_cycle != cycle
+                or old_switch_time != switch_time
+            ):
                 conn.execute(
                     "UPDATE shift_groups SET anchor_at=? WHERE id=?", (int(time.time()), group_id)
                 )
@@ -977,8 +995,8 @@ def upsert_group(payload: dict[str, Any]) -> int:
         else:
             cur = conn.execute(
                 "INSERT INTO shift_groups(name, enabled, failover_enabled, ddns_record, cycle, "
-                "anchor_at, created_at) VALUES(?,?,?,?,?,?,?)",
-                (name, enabled, failover, ddns_record, cycle, int(time.time()), int(time.time())),
+                "switch_time, anchor_at, created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (name, enabled, failover, ddns_record, cycle, switch_time, int(time.time()), int(time.time())),
             )
             group_id = int(cur.lastrowid or 0)
 

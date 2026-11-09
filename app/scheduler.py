@@ -6,6 +6,9 @@ import datetime as dt
 import logging
 import threading
 import time
+import urllib.request
+
+import requests
 
 from . import aliyun, billing, dns, messages, notify, repo, settings
 from .shift import engine, keepalive_window, _timezone
@@ -123,6 +126,15 @@ def _loop() -> None:
             engine.reconcile_all()
         except Exception:  # noqa: BLE001
             log.exception("对账轮次异常")
+
+        # Uptime Kuma 存活心跳（fork 新增）：调度线程本身就是「服务还活着」
+        # 的证明 —— 线程卡死/进程僵死时这里不再执行，Kuma 自然标 DOWN。
+        # 先验本机 /api/health（HTTP 层也在跑），通过才推；失败不推、不记
+        # 敏感信息（push URL 里含监控 key，日志里只写成功/失败）。
+        try:
+            _maybe_kuma_heartbeat()
+        except Exception:  # noqa: BLE001
+            log.exception("Kuma 心跳检查异常")
 
         try:
             _maybe_daily_report()
@@ -434,6 +446,55 @@ def _status_reached(info, pending: str) -> bool:
         return info.status == "Stopped"
     # 未知目标：按 status 相等判断
     return info.status == pending
+
+
+_last_kuma_push = 0.0
+_last_kuma_attempt = 0.0
+
+
+def _maybe_kuma_heartbeat(now: float | None = None) -> None:
+    """Uptime Kuma Push 心跳（fork 新增，默认关闭）。
+
+    配置在设置里（kuma_enabled / kuma_push_url / kuma_interval，默认 300 秒，
+    与现网 CDT push 监控的 interval 对齐）。每轮对账后检查：到间隔了才推，
+    推之前先 GET 本机 /api/health——HTTP 层挂了就不推，让 Kuma 标 DOWN，
+    而不是「进程在、接口已死」还报平安。失败时 60 秒内不再重试，避免日志刷屏；
+    成功才更新上次推送时间。push URL 绝不写进日志。
+    """
+    global _last_kuma_push, _last_kuma_attempt
+    config = repo.get_settings()
+    if config.get("kuma_enabled") != "1":
+        return
+    push_url = str(config.get("kuma_push_url") or "").strip()
+    if not push_url:
+        return
+    now_ts = float(now if now is not None else time.time())
+    try:
+        interval = max(60, min(3600, int(config.get("kuma_interval") or "300")))
+    except (TypeError, ValueError):
+        interval = 300
+    if now_ts - _last_kuma_push < interval:
+        return
+    if now_ts - _last_kuma_attempt < 60:
+        return
+    _last_kuma_attempt = now_ts
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{settings.LISTEN_PORT}/api/health", timeout=5
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"health 返回 {resp.status}")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Kuma 心跳未推送：本机健康检查失败（%s）", exc)
+        return
+    try:
+        resp = requests.get(push_url, timeout=10)
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Kuma 心跳推送失败：%s", exc)
+        return
+    _last_kuma_push = now_ts
+    log.info("Kuma 心跳已推送")
 
 
 def _maybe_daily_report() -> None:

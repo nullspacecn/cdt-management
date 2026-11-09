@@ -84,8 +84,13 @@ CREATE TABLE IF NOT EXISTS shift_groups (
     ddns_record       TEXT    NOT NULL DEFAULT '',
     anchor_at         INTEGER NOT NULL DEFAULT 0,
     created_at        INTEGER NOT NULL DEFAULT 0,
-    -- 排班周期：day = 一天一轮（按小时 / 固定时刻表），month = 一月一轮（按天）
-    cycle             TEXT    NOT NULL DEFAULT 'day'
+    -- 排班周期：day = 一天一轮（按小时 / 固定时刻表），month = 一月一轮（按天），
+    -- daily24 = 每天固定时刻换班一次、每人 24 小时（见 app/shift.py _duty_at_daily24）。
+    cycle             TEXT    NOT NULL DEFAULT 'day',
+    -- daily24 的每日换班时刻（HH:MM，默认 03:00）。其余周期不使用该字段。
+    -- anchor_at 是该模式的轮换起点：其所在日期的 switch_time 时刻由 members[0]
+    -- 当班，之后每天同一时刻按 position 顺序交替。
+    switch_time       TEXT    NOT NULL DEFAULT '03:00'
 );
 
 -- 组成员：按 position 顺序轮换。老字段 hours 仍保留（兼容老组），
@@ -265,6 +270,11 @@ DEFAULTS: dict[str, str] = {
     "notify_tg_token": "",
     "notify_tg_chat_id": "",
     "notify_tg_proxy": "",
+    # Uptime Kuma 存活心跳（Push）：面板内置定时推，替代旧换班脚本的 5 分钟心跳。
+    # URL 里含监控 key，绝不在日志/接口里原样输出，只返回是否已配置。
+    "kuma_enabled": "0",
+    "kuma_push_url": "",
+    "kuma_interval": "300",
     # 邮件
     "notify_mail_enabled": "0",
     "notify_mail_host": "",
@@ -322,6 +332,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         },
         "shift_groups": {
             "cycle": "TEXT NOT NULL DEFAULT 'day'",
+            "switch_time": "TEXT NOT NULL DEFAULT '03:00'",
         },
         "events": {
             "status": "TEXT NOT NULL DEFAULT 'done'",

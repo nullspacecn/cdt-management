@@ -300,11 +300,64 @@ def _duty_at_month(group: dict[str, Any], now_ts: float) -> tuple[dict[str, Any]
     return member, int((month_start + dt.timedelta(days=start_day - 1)).timestamp())
 
 
+def is_daily24_cycle(group: dict[str, Any]) -> bool:
+    """排班周期是不是「每天固定时刻换班一次、每人 24 小时」。
+
+    fork 新增（上游只有 day/month）：每天 switch_time（默认 03:00）换班，
+    成员按 position 顺序逐日交替。anchor_at 是轮换起点：其所在日期的
+    switch_time 时刻由 members[0] 当班，之后每天同一时刻交替。
+    部署时须把 anchor_at 显式设到一个 switch_time 时刻（例如 2026-11-09
+    03:00 北京时间、A 当班），否则起点由建组时间决定，当班归属会漂移。
+    """
+    return str(group.get("cycle") or "day") == "daily24"
+
+
+def _daily24_switch_minutes(group: dict[str, Any]) -> int:
+    minutes = _hhmm_to_minutes(str(group.get("switch_time") or "03:00"))
+    return minutes if minutes >= 0 else 3 * 60
+
+
+def _duty_at_daily24(group: dict[str, Any], now_ts: float) -> tuple[dict[str, Any], int] | None:
+    """每天固定时刻换班、每人 24 小时：按组时区的日历日判定当班。
+
+    slot 起点是最近一次 switch_time 时刻；班次序号 = 该日与 anchor 日
+    相差的天数，对成员数取模。纯日历计算，不随容器重启/建组时间漂移，
+    startup 时第一轮 reconcile 就能按当日班次修正开关状态。
+    """
+    members = active_members(group)
+    if not members:
+        return None
+    tz_name = _group_timezone(group)
+    tz = _timezone(tz_name)
+    switch_minutes = _daily24_switch_minutes(group)
+    now = dt.datetime.fromtimestamp(now_ts, tz)
+    today_switch = now.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(
+        minutes=switch_minutes
+    )
+    last_switch = today_switch if now >= today_switch else today_switch - dt.timedelta(days=1)
+    anchor_ts = float(group.get("anchor_at") or group.get("created_at") or now_ts)
+    anchor_dt = dt.datetime.fromtimestamp(anchor_ts, tz)
+    anchor_switch = anchor_dt.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(
+        minutes=switch_minutes
+    )
+    # anchor 本身若落在当日 switch_time 之后，起点应是当日那次换班
+    # （anchor_dt 当天 03:00 之后建组，members[0] 从当天 03:00 起当班）；
+    # 若 anchor 在当日 switch_time 之前，起点回退到前一天。
+    if anchor_dt < anchor_switch:
+        anchor_switch -= dt.timedelta(days=1)
+    day_index = (last_switch.date() - anchor_switch.date()).days
+    member = members[day_index % len(members)]
+    return member, int(last_switch.timestamp())
+
+
 def duty_at(group: dict[str, Any], now_ts: float) -> tuple[dict[str, Any], int] | None:
     """返回 (当班成员, 该班次开始时间戳)。按 position 顺序循环轮换。"""
     members = active_members(group)
     if len(members) < 2:
         return None
+
+    if is_daily24_cycle(group):
+        return _duty_at_daily24(group, now_ts)
 
     if is_month_cycle(group):
         return _duty_at_month(group, now_ts)
@@ -471,6 +524,16 @@ def next_switch_at(group: dict[str, Any], now_ts: float) -> float | None:
     members = active_members(group)
     if len(members) < 2:
         return None
+
+    if is_daily24_cycle(group):
+        tz_name = _group_timezone(group)
+        now = dt.datetime.fromtimestamp(now_ts, _timezone(tz_name))
+        switch_minutes = _daily24_switch_minutes(group)
+        today_switch = now.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(
+            minutes=switch_minutes
+        )
+        nxt = today_switch if now < today_switch else today_switch + dt.timedelta(days=1)
+        return int(nxt.timestamp())
 
     if is_month_cycle(group):
         return _next_switch_month(group, now_ts)
@@ -1478,10 +1541,76 @@ class Engine:
         if not previously_settled:
             repo.add_event_progress(event_id, f"当班 {duty.get('label')} 已开机", once=True)
 
+        # 4.5) DDNS 前置（fork 新增，替代原来「全部停机后才同步」）：
+        # 当班已 Running 且 IP 就绪时，先把域名指到新当班机，确认同步成功
+        # （或等满放行时限）再停旧机。旧机在 DNS 生效前仍在跑，新连接无论
+        # 解析到新 IP 还是旧 IP 都能通；DDNS 失败时本轮不许停旧机，等下一轮
+        # 重试。等满 _DDNS_WAIT_SECONDS 仍失败则放行停机（与原有结算放行一致），
+        # 失败原因留在进度和结算报告里。已结算的班次不走这里（由第 6 步维持）。
+        ddns_text = ""
+        ddns_brief = ""
+        ddns_report: dns.DDNSReport | None = None
+        ddns_ok = True
+        ddns_early_done = False
+        ddns_blocked = False
+        if not previously_settled and ddns_enabled:
+            ddns_bound_early = bool(repo.dns_records_of(dns.TARGET_GROUP, group_id)) or bool(
+                repo.dns_records_of(dns.TARGET_SERVER, int(duty["id"]))
+            )
+            if ddns_bound_early:
+                ddns_report = self._sync_ddns(
+                    duty, config, dns.TARGET_GROUP, group_id, verify=True
+                )
+                ddns_text = ddns_report.status
+                ddns_brief = ddns_report.brief
+                ddns_ok = dns.is_success(ddns_text)
+                ddns_early_done = True
+                wait_key_early = f"ddns_wait:{group_id}:{slot_key}"
+                if ddns_ok:
+                    repo.clear_flag(wait_key_early)
+                    # 一轮换班只记一次 DDNS：首次同步（IP 变了）才记，后续轮次
+                    # IP 未变时不再补行 —— 与第 6 步同一套去重（见下），否则
+                    # 换班跨多轮会在进度里留下「首次指向」「IP 未变化」两行。
+                    _existing = repo.get_event(event_id) or {}
+                    _logged = any(
+                        "DDNS：" in str(step.get("text") or "")
+                        for step in (_existing.get("progress") or [])
+                    )
+                    if not _logged or any(r.changed for r in ddns_report.results):
+                        repo.add_event_progress(event_id, f"DDNS：{ddns_report.detail}")
+                else:
+                    waited_early = repo.flag_age(wait_key_early)
+                    if waited_early < 0:
+                        repo.set_flag(wait_key_early)
+                        ddns_blocked = True
+                    elif waited_early >= _DDNS_WAIT_SECONDS:
+                        ddns_ok = True
+                        repo.clear_flag(wait_key_early)
+                        repo.add_event(
+                            "error",
+                            messages.ev("DDNS 未同步，换班照常继续", messages.obj_group(str(name))),
+                            f"已放行停机 / 等待 {_DDNS_WAIT_SECONDS // 60} 分钟仍未同步（{ddns_text}），"
+                            "请检查记录名、Token 与 Zone",
+                            level="warning",
+                            group_id=group_id,
+                        )
+                        repo.add_event_progress(
+                            event_id, f"DDNS：{ddns_report.detail}（等待放行）", once=True
+                        )
+                    else:
+                        ddns_blocked = True
+                        repo.add_event_progress(
+                            event_id, f"DDNS 未同步，暂缓停机：{ddns_text}", once=True
+                        )
+
         # 5) 停非当班（此时才停）。物理停机（StopCharging / KeepCharging / Stop /
         #    Not-applicable）就算停好，不再重发；普通停机照常收费但已到位，无需死循环。
         all_stopped = True
         for server in others:
+            if ddns_blocked:
+                # DDNS 还没指过去：旧机必须继续跑，本轮不下发任何停机指令
+                all_stopped = False
+                continue
             if int(server["id"]) in unreadable:
                 # 状态读不到的成员：不下发停机（不知道它现在是什么状态，重发也没用），
                 # 但也不能算「已到位」—— 否则这一班会带着一台可能还在跑的机器结算。
@@ -1525,16 +1654,19 @@ class Engine:
         if all_stopped and not previously_settled:
             repo.add_event_progress(event_id, f"非当班{messages.stop_tail(others)}", once=True)
 
-        # 6) 全部实例状态确认到位之后才动 DDNS。
-        #    以前是「当班一开机就同步」，非当班还在跑的时候域名已经指过去了；而且
-        #    停机那一轮还会再同步一次，进度里冒出重复的「DDNS：✅ 已同步」这种没意义的一行。
-        ddns_text = ""
+        # 6) 全部实例状态确认到位之后再确认 DDNS。
+        #    fork 已改：DDNS 主同步在第 4.5 步（当班 Running 后、停旧机前）完成，
+        #    这里只在「前置没做」（已结算班次 / 未启用 DDNS 时 ddns_enabled 为假
+        #    但第 4.5 步被跳过）时补一次；前置已做过的不再重复同步，进度去重
+        #    也会拦住第二行 DDNS（见下面的 logged 判断）。
         # 概览和通知是两套文案：status 给通知（短），brief 给事件概览（带「已更新 / IP 未变化」）。
         # 换班概览以前错用了 status，列表里就只剩「✅ 已同步」，和保活、手动开机不一致。
-        ddns_brief = ""
-        ddns_report: dns.DDNSReport | None = None
-        ddns_ok = True
-        if all_stopped:
+        if not ddns_early_done:
+            ddns_text = ""
+            ddns_brief = ""
+            ddns_report = None
+            ddns_ok = True
+        if all_stopped and not ddns_early_done:
             # 首次结算去 Cloudflare 查一次真实值（用户明确要求的时间点）；
             # 之后每轮结算仍走本地缓存，避免每分钟打一次读请求。
             ddns_report = self._sync_ddns(
@@ -2492,7 +2624,7 @@ class Engine:
             if len(members) < 2:
                 raise ValueError("组内启用的成员不足两台")
 
-            if is_month_cycle(group) or _is_timetable_group(group):
+            if is_month_cycle(group) or is_daily24_cycle(group) or _is_timetable_group(group):
                 return self._finish_manual(
                     self._manual_switch_timetable(group, config, now, now_ts)
                 )

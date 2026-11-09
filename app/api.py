@@ -609,6 +609,8 @@ def _group_payload(
         "enabled": bool(group.get("enabled")),
         "failover_enabled": bool(group.get("failover_enabled")),
         "cycle": str(group.get("cycle") or "day"),
+        # daily24 的每日换班时刻（HH:MM，默认 03:00）
+        "switch_time": str(group.get("switch_time") or "03:00"),
         # 绑定关系在 DNS 页维护，这里只是读出来显示（可能有多条，顿号连接）
         "ddns_record": "、".join((books or {}).get("groups", {}).get(int(group["id"]), [])),
         "anchor_at": group.get("anchor_at") or 0,
@@ -929,8 +931,8 @@ def register(app: FastAPI) -> None:
     @app.post("/api/v1/groups")
     def save_group(request: Request, payload: dict[str, Any], user: str = Depends(require_admin)):  # noqa: ANN202, ARG001
         require_csrf(request)
-        # 一月一轮按天排，没有小时边界，时刻表校验（盖满一天）不适用
-        if str(payload.get("cycle") or "day") != "month":
+        # 一月一轮按天排、每天固定时刻换班一轮都没有小时边界，时刻表校验（盖满一天）不适用
+        if str(payload.get("cycle") or "day") not in ("month", "daily24"):
             _validate_group_timetable(payload)
         is_new = not int(payload.get("id") or 0)
         group_id = repo.upsert_group(payload)
@@ -1068,6 +1070,12 @@ def register(app: FastAPI) -> None:
                 "chat_id": config.get("notify_tg_chat_id") or "",
                 "proxy": config.get("notify_tg_proxy") or "",
             },
+            # Uptime Kuma 心跳：只返回是否已配置，URL 本身含监控 key，绝不回显
+            "kuma": {
+                "enabled": config.get("kuma_enabled") == "1",
+                "url_configured": bool(config.get("kuma_push_url")),
+                "interval": config.get("kuma_interval") or "300",
+            },
             "email": {
                 "enabled": config.get("notify_mail_enabled") == "1",
                 "host": config.get("notify_mail_host") or "",
@@ -1195,6 +1203,17 @@ def register(app: FastAPI) -> None:
             put_str("notify_tg_proxy", tg.get("proxy"))
             if tg.get("token"):
                 updates["notify_tg_token"] = str(tg["token"])
+
+        kuma = payload.get("kuma") or {}
+        if kuma:
+            put_bool("kuma_enabled", kuma.get("enabled"))
+            if kuma.get("interval") is not None:
+                interval = _as_int(kuma["interval"], "Kuma 心跳间隔")
+                if not 60 <= interval <= 3600:
+                    raise ValueError("Kuma 心跳间隔应在 60–3600 秒之间")
+                updates["kuma_interval"] = str(interval)
+            if kuma.get("url"):
+                updates["kuma_push_url"] = str(kuma["url"]).strip()
 
         mail = payload.get("email") or {}
         if mail:

@@ -3,7 +3,8 @@
 
 锁死三条规则：
   1. 新建换班组保存后立刻按排班表校正组员状态：该当班的先开机，等它 Running
-     再把其余成员节省停机，全部到位后才同步 DDNS —— 顺序和自动换班一致。
+     后先把域名指到当班机、确认同步，再把其余成员节省停机 —— 顺序和自动换班
+     一致（fork 改动）。
      整个过程只有一条「组名：新建换班组」事件，结算时标题也不改叫「换班完成」。
   2. 新建组那一班不发结算通知（用户刚点完保存，不需要再收一份报告）。
   3. 解散换班组不给实例下发任何启停指令：跑着的继续跑、停着的继续停着，
@@ -152,9 +153,9 @@ class NewGroupBootstrap(_Base):
         self.assertTrue(any("需要节省停机" in t for t in texts), texts)
         self.assertEqual(sum("已下发启动当班" in t for t in texts), 1, texts)
         self.assertEqual(sum("已下发停机" in t for t in texts), 1, texts)
-        # DDNS 排在停机之后：状态没全部到位不碰域名
+        # DDNS（fork）排在停机之前：当班 Running 后先指域名，确认同步再停旧机
         ddns_at = next(i for i, t in enumerate(texts) if t.startswith("DDNS："))
-        self.assertGreater(ddns_at, next(i for i, t in enumerate(texts) if "已下发停机" in t), texts)
+        self.assertLess(ddns_at, next(i for i, t in enumerate(texts) if "已下发停机" in t), texts)
         self.assertEqual(texts[-1], "全部状态确认完毕")
 
         # 新建组这一班不发报告

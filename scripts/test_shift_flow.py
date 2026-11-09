@@ -4,9 +4,11 @@
 锁死两条容易回归的规则：
   1. 一轮换班只产生 **一条** 事件（启动当班 / 停机非当班 / DDNS 都是同一条事件的进度），
      早期版本会给每一步各开一条，界面上一次换班冒出三条记录。
-  2. DDNS 动作排在「当班 Running + 非当班全部停机」确认之后，且整条事件里只记一次，
-     不会出现两条重复的「DDNS：✅ 已同步」（IP 没变时的旧文案是「✅ 无变化」，
-     现已统一成「已同步」，进度靠去重保证只记一次）。
+  2. DDNS 动作排在「当班 Running」确认之后、停非当班之前（fork 改动）：
+     先把域名指到新当班机、确认同步成功再停旧机，旧机在 DNS 生效前仍在跑，
+     新连接无论解析到新旧 IP 都能通。整条事件里只记一次，不会出现两条
+     重复的「DDNS：✅ 已同步」（IP 没变时的旧文案是「✅ 无变化」，现已统一
+     成「已同步」，进度靠去重保证只记一次）。
 
 跑法：python scripts/test_shift_flow.py
 """
@@ -69,7 +71,8 @@ class ShiftFlow(unittest.TestCase):
         db.execute(
             "UPDATE shift_groups SET anchor_at=? WHERE id=?", (int(now_ts - 3600), cls.group_id)
         )
-        # 换班组绑一条域名：DDNS 是换班流程里的最后一步，事件里要能看到这一行
+        # 换班组绑一条域名：DDNS 是换班流程里「当班 Running 后、停机前」的一步，
+        # 事件里要能看到这一行
         repo.set_settings({"ddns_enabled": "1"})
         repo.ensure_dns_record("shift-flow.example.com")
         repo.bind_dns_record("shift-flow.example.com", dns.TARGET_GROUP, cls.group_id)
@@ -103,8 +106,8 @@ class ShiftFlow(unittest.TestCase):
         self.assertEqual(sum("已下发启动当班" in t for t in texts), 1, texts)
         self.assertEqual(sum("已下发停机" in t for t in texts), 1, texts)
         self.assertEqual(sum(t.startswith("DDNS：") for t in texts), 1, texts)
-        # DDNS 排在停机之后，且是最后一步之前
-        self.assertGreater(
+        # DDNS（fork）排在停机之前：先指域名、再停旧机，且是最后一步之前
+        self.assertLess(
             next(i for i, t in enumerate(texts) if t.startswith("DDNS：")),
             next(i for i, t in enumerate(texts) if "已下发停机" in t),
             texts,

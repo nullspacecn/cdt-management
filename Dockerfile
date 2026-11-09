@@ -46,7 +46,7 @@ LABEL org.opencontainers.image.title="CDT-Management" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.created="${BUILT_AT}" \
-      org.opencontainers.image.source="https://github.com/BeacherZ/cdt-management" \
+      org.opencontainers.image.source="https://github.com/nullspacecn/cdt-management" \
       cn.cdt-management.version="${VERSION}"
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
